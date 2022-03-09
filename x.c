@@ -19,6 +19,7 @@ char *argv0;
 #include "arg.h"
 #include "st.h"
 #include "win.h"
+#include "hb.h"
 
 /* types used in config.h */
 typedef struct {
@@ -1062,6 +1063,9 @@ xunloadfont(Font *f)
 void
 xunloadfonts(void)
 {
+  /* Clear Harfbuzz font cache. */
+  hbunloadfonts();
+
 	/* Free the loaded fonts in the font cache.  */
 	while (frclen > 0)
 		XftFontClose(xw.dpy, frc[--frclen].font);
@@ -1237,6 +1241,8 @@ xinit(int cols, int rows)
 	xsel.xtarget = XInternAtom(xw.dpy, "UTF8_STRING", 0);
 	if (xsel.xtarget == None)
 		xsel.xtarget = XA_STRING;
+
+	boxdraw_xinit(xw.dpy, xw.cmap, xw.draw, xw.vis);
 }
 
 int
@@ -1261,7 +1267,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 		mode = glyphs[i].mode;
 
 		/* Skip dummy wide-character spacing. */
-		if (mode == ATTR_WDUMMY)
+		if (mode & ATTR_WDUMMY)
 			continue;
 
 		/* Determine font for glyph if different from previous glyph. */
@@ -1283,8 +1289,13 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 			yp = winy + font->ascent;
 		}
 
-		/* Lookup character index with default font. */
-		glyphidx = XftCharIndex(xw.dpy, font->match, rune);
+    if (mode & ATTR_BOXDRAW) {
+      /* minor shoehorning: boxdraw uses only this ushort */
+      glyphidx = boxdrawindex(&glyphs[i]);
+  } else {
+      /* Lookup character index with default font. */
+      glyphidx = XftCharIndex(xw.dpy, font->match, rune);
+    }
 		if (glyphidx) {
 			specs[numspecs].font = font->match;
 			specs[numspecs].glyph = glyphidx;
@@ -1367,6 +1378,9 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 		xp += runewidth;
 		numspecs++;
 	}
+
+	/* Harfbuzz transformation for ligatures. */
+	hbtransform(specs, glyphs, len, x, y);
 
 	return numspecs;
 }
@@ -1488,8 +1502,12 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	r.width = width;
 	XftDrawSetClipRectangles(xw.draw, winx, winy, &r, 1);
 
-	/* Render the glyphs. */
-	XftDrawGlyphFontSpec(xw.draw, fg, specs, len);
+  if (base.mode & ATTR_BOXDRAW) {
+    drawboxes(winx, winy, width / len, win.ch, fg, bg, specs, len);
+  } else {
+    /* Render the glyphs. */
+    XftDrawGlyphFontSpec(xw.draw, fg, specs, len);
+  }
 
 	/* Render underline and strikethrough. */
 	if (base.mode & ATTR_UNDERLINE) {
@@ -1517,7 +1535,7 @@ xdrawglyph(Glyph g, int x, int y)
 }
 
 void
-xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
+xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og, Line line, int len)
 {
 	Color drawcol;
 
@@ -1526,13 +1544,17 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 		og.mode ^= ATTR_REVERSE;
 	xdrawglyph(og, ox, oy);
 
+	/* Redraw the line where cursor was previously.
+	 * It will restore the ligatures broken by the cursor. */
+	xdrawline(line, 0, oy, len);
+
 	if (IS_SET(MODE_HIDE))
 		return;
 
 	/*
 	 * Select the right color for the right mode.
 	 */
-	g.mode &= ATTR_BOLD|ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE;
+	g.mode &= ATTR_BOLD|ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE|ATTR_BOXDRAW;
 
 	if (IS_SET(MODE_REVERSE)) {
 		g.mode |= ATTR_REVERSE;
